@@ -55,16 +55,19 @@ pub struct InputMethodHandle {
 }
 
 impl InputMethodHandle {
-    pub(super) fn add_instance(&self, instance: &ZwpInputMethodV2) {
+    /// Returns whether `instance` became the seat's active input method.
+    pub(super) fn add_instance(&self, instance: &ZwpInputMethodV2) -> bool {
         let mut inner = self.inner.lock().unwrap();
         if inner.instance.is_some() {
             // Only one input method per seat: a newcomer is made unavailable and inert.
             instance.unavailable();
+            false
         } else {
             inner.instance = Some(Instance {
                 object: instance.clone(),
                 serial: 0,
             });
+            true
         }
     }
 
@@ -379,8 +382,13 @@ where
     fn destroyed(&self, _state: &mut D, _client: ClientId, input_method: &ZwpInputMethodV2) {
         // Only the active instance leaving frees the seat.
         if self.handle.is_active_instance(input_method) {
-            self.handle.inner.lock().unwrap().instance = None;
-            self.text_input_handle.leave();
+            // The text input keeps its focus and stays enabled: text-input-unstable-v3 has no event
+            // for "no input method", and `leave` would end the field's enabled state. A later input
+            // method is activated for it (`TextInputHandle::activate_late_input_method`).
+            let mut inner = self.handle.inner.lock().unwrap();
+            inner.instance = None;
+            // The popup surface belonged to the departed method.
+            inner.popup_handle.surface = None;
         }
     }
 }
