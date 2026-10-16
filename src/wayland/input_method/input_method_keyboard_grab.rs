@@ -20,7 +20,7 @@ use crate::wayland::text_input::TextInputHandle;
 use crate::{
     backend::input::{InputTime, KeyState, Keycode},
     utils::Serial,
-    wayland::Dispatch2,
+    wayland::{Dispatch2, gate::Standing},
 };
 
 #[derive(Default, Debug)]
@@ -126,6 +126,8 @@ where
 pub struct InputMethodKeyboardUserData<D: SeatHandler> {
     pub(super) handle: InputMethodKeyboardGrab,
     pub(crate) keyboard_handle: KeyboardHandle<D>,
+    /// Whether this is a grab of the seat; the one of a held or refused input method is not.
+    pub(crate) standing: Standing,
 }
 
 impl<D: SeatHandler> fmt::Debug for InputMethodKeyboardUserData<D> {
@@ -139,6 +141,10 @@ impl<D: SeatHandler> fmt::Debug for InputMethodKeyboardUserData<D> {
 
 impl<D: SeatHandler + 'static> Dispatch2<ZwpInputMethodKeyboardGrabV2, D> for InputMethodKeyboardUserData<D> {
     fn destroyed(&self, state: &mut D, _client: ClientId, _object: &ZwpInputMethodKeyboardGrabV2) {
+        if self.standing != Standing::Live {
+            // It never took the seat's keyboard, so it has none to give back.
+            return;
+        }
         let mut inner = self.handle.inner.lock().unwrap();
         inner.grab = None;
         inner.keymap_id = None;

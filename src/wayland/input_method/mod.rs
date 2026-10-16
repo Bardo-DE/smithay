@@ -59,6 +59,8 @@
 //!
 //! ```
 
+use std::sync::Arc;
+
 use wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, backend::GlobalId,
     protocol::wl_surface::WlSurface,
@@ -72,7 +74,7 @@ use wayland_protocols_misc::zwp_input_method_v2::server::{
 use crate::{
     input::{Seat, SeatHandler},
     utils::{Logical, Rectangle},
-    wayland::{Dispatch2, GlobalData, GlobalDispatch2},
+    wayland::{Dispatch2, Gate, GlobalDispatch2, gate::StandingCell},
 };
 
 pub use input_method_handle::{InputMethodHandle, InputMethodUserData};
@@ -86,10 +88,13 @@ const MANAGER_VERSION: u32 = 1;
 /// The role of the input method popup.
 pub const INPUT_POPUP_SURFACE_ROLE: &str = "zwp_input_popup_surface_v2";
 
+mod held;
 mod input_method_handle;
 mod input_method_keyboard_grab;
 mod input_method_popup_surface;
 pub use input_method_popup_surface::{PopupParent, PopupSurface};
+
+use held::{HeldInputMethod, HeldInputMethods};
 
 /// Adds input method popup to compositor state
 pub trait InputMethodHandler {
@@ -104,6 +109,16 @@ pub trait InputMethodHandler {
 
     /// Sets the parent location so the popup surface can be placed correctly
     fn parent_geometry(&self, parent: &WlSurface) -> Rectangle<i32, Logical>;
+
+    /// Whether `client` may be an input method.
+    ///
+    /// Asked when the client calls `get_input_method`. The default is [`Gate::Open`]. See [`Gate`]
+    /// for what [`Gate::Hold`] and [`Gate::Refuse`] do here (a refused input method is told
+    /// `unavailable`); held input methods are settled with [`InputMethodManagerState::release`].
+    fn input_method_gate(&mut self, client: &Client) -> Gate {
+        let _ = client;
+        Gate::Open
+    }
 }
 
 /// Extends [Seat] with input method functionality
@@ -124,12 +139,21 @@ impl<D: SeatHandler + 'static> InputMethodSeat for Seat<D> {
 #[allow(missing_debug_implementations)]
 pub struct InputMethodManagerGlobalData {
     filter: Box<dyn for<'c> Fn(&'c Client) -> bool + Send + Sync>,
+    held: HeldInputMethods,
+}
+
+/// Data associated with a `zwp_input_method_manager_v2` object.
+#[derive(Debug)]
+pub struct InputMethodManagerUserData {
+    held: HeldInputMethods,
 }
 
 /// State of wp misc input method protocol
 #[derive(Debug)]
 pub struct InputMethodManagerState {
     global: GlobalId,
+    /// Input methods that clients created while on hold, by client.
+    held: HeldInputMethods,
 }
 
 impl InputMethodManagerState {
@@ -137,18 +161,20 @@ impl InputMethodManagerState {
     pub fn new<D, F>(display: &DisplayHandle, filter: F) -> Self
     where
         D: GlobalDispatch<ZwpInputMethodManagerV2, InputMethodManagerGlobalData>,
-        D: Dispatch<ZwpInputMethodManagerV2, GlobalData>,
+        D: Dispatch<ZwpInputMethodManagerV2, InputMethodManagerUserData>,
         D: Dispatch<ZwpInputMethodV2, InputMethodUserData<D>>,
         D: SeatHandler,
         D: 'static,
         F: for<'c> Fn(&'c Client) -> bool + Send + Sync + 'static,
     {
+        let held = HeldInputMethods::default();
         let data = InputMethodManagerGlobalData {
             filter: Box::new(filter),
+            held: held.clone(),
         };
         let global = display.create_global::<D, ZwpInputMethodManagerV2, _>(MANAGER_VERSION, data);
 
-        Self { global }
+        Self { global, held }
     }
 
     /// Get the id of ZwpTextInputManagerV3 global
@@ -159,7 +185,7 @@ impl InputMethodManagerState {
 
 impl<D> GlobalDispatch2<ZwpInputMethodManagerV2, D> for InputMethodManagerGlobalData
 where
-    D: Dispatch<ZwpInputMethodManagerV2, GlobalData>,
+    D: Dispatch<ZwpInputMethodManagerV2, InputMethodManagerUserData>,
     D: Dispatch<ZwpInputMethodV2, InputMethodUserData<D>>,
     D: SeatHandler,
     D: 'static,
@@ -172,7 +198,12 @@ where
         resource: New<ZwpInputMethodManagerV2>,
         data_init: &mut DataInit<'_, D>,
     ) {
-        data_init.init(resource, GlobalData);
+        data_init.init(
+            resource,
+            InputMethodManagerUserData {
+                held: self.held.clone(),
+            },
+        );
     }
 
     fn can_view(&self, client: &Client) -> bool {
@@ -180,7 +211,7 @@ where
     }
 }
 
-impl<D> Dispatch2<ZwpInputMethodManagerV2, D> for GlobalData
+impl<D> Dispatch2<ZwpInputMethodManagerV2, D> for InputMethodManagerUserData
 where
     D: Dispatch<ZwpInputMethodV2, InputMethodUserData<D>>,
     D: SeatHandler + InputMethodHandler,
@@ -189,7 +220,7 @@ where
     fn request(
         &self,
         state: &mut D,
-        _client: &Client,
+        client: &Client,
         _: &ZwpInputMethodManagerV2,
         request: zwp_input_method_manager_v2::Request,
         _dh: &DisplayHandle,
@@ -197,6 +228,7 @@ where
     ) {
         match request {
             zwp_input_method_manager_v2::Request::GetInputMethod { seat, input_method } => {
+                let gate = state.input_method_gate(client);
                 let seat = Seat::<D>::from_resource(&seat).unwrap();
 
                 let user_data = seat.user_data();
@@ -205,6 +237,7 @@ where
                 let handle = user_data.get::<InputMethodHandle>().unwrap();
                 let text_input_handle = user_data.get::<TextInputHandle>().unwrap();
                 let keyboard_handle = seat.get_keyboard().unwrap();
+                let standing = Arc::new(StandingCell::new(gate.into()));
                 let instance = data_init.init(
                     input_method,
                     InputMethodUserData {
@@ -215,11 +248,28 @@ where
                         popup_repositioned: D::popup_repositioned,
                         new_popup: D::new_popup,
                         dismiss_popup: D::dismiss_popup,
+                        standing: standing.clone(),
                     },
                 );
-                if handle.add_instance(&instance) {
-                    // A text input enabled before this input method bound is activated for it.
-                    text_input_handle.activate_late_input_method(handle, state);
+                let held = HeldInputMethod {
+                    object: instance.clone(),
+                    standing,
+                    handle: handle.clone(),
+                    text_input_handle: text_input_handle.clone(),
+                };
+                match gate {
+                    Gate::Open => {
+                        if handle.add_instance(&instance) {
+                            // A text input enabled before this input method bound is activated for it.
+                            text_input_handle.activate_late_input_method(handle, state);
+                        }
+                    }
+                    Gate::Refuse => held.refuse(),
+                    Gate::Hold => {
+                        if let Err(held) = self.held.hold(client.id(), held) {
+                            held.refuse();
+                        }
+                    }
                 }
             }
             zwp_input_method_manager_v2::Request::Destroy => {
