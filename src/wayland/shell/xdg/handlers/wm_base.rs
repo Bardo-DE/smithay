@@ -20,7 +20,10 @@ use wayland_server::{
     protocol::wl_surface::WlSurface,
 };
 
-use super::{ShellClient, ShellClientData, XdgPositionerUserData, XdgShellHandler, XdgSurfaceUserData};
+use super::{
+    super::{XDG_POPUP_ROLE, XDG_TOPLEVEL_ROLE},
+    ShellClient, ShellClientData, XdgPositionerUserData, XdgShellHandler, XdgSurfaceUserData,
+};
 
 impl<D> GlobalDispatch2<XdgWmBase, D> for GlobalData
 where
@@ -65,7 +68,13 @@ where
                 data_init.init(id, XdgPositionerUserData::default());
             }
             xdg_wm_base::Request::GetXdgSurface { id, surface } => {
-                let has_role = compositor::get_role(&surface).is_some();
+                // A wl_surface keeps its role after the role object is destroyed and may take the
+                // same role again (wl_surface: "assigned the same role again"), so a former
+                // xdg_toplevel or xdg_popup is not "another role": GTK reuses a popover's
+                // wl_surface each time it shows it. xdg_toplevel/xdg_popup creation checks that
+                // the role is the same one.
+                let has_role = compositor::get_role(&surface)
+                    .is_some_and(|role| role != XDG_TOPLEVEL_ROLE && role != XDG_POPUP_ROLE);
                 let has_buffer = has_buffer(&surface);
                 // Do not assign a role to the surface here
                 // xdg_surface is not role, only xdg_toplevel and
