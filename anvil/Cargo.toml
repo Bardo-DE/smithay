@@ -30,7 +30,7 @@ path = ".."
 default-features = false
 features = ["composite"]
 optional = true
-version = "0.14.0"
+version = "0.13.0"
 
 [features]
 debug = ["fps_ticker", "image/png", "renderdoc"]

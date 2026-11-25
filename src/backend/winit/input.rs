@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use winit::{
     dpi::PhysicalPosition,
-    event::{ElementState, MouseButton as WinitMouseButton, MouseScrollDelta, ScrollSource},
+    event::{ElementState, MouseButton as WinitMouseButton, MouseScrollDelta},
 };
 
 use crate::backend::input::{
@@ -124,7 +124,6 @@ impl AbsolutePositionEvent<WinitInput> for WinitMouseMovedEvent {
 pub struct WinitMouseWheelEvent {
     pub(crate) time: InputTime,
     pub(crate) delta: MouseScrollDelta,
-    pub(crate) source: ScrollSource,
 }
 
 impl Event<WinitInput> for WinitMouseWheelEvent {
@@ -139,10 +138,9 @@ impl Event<WinitInput> for WinitMouseWheelEvent {
 
 impl PointerAxisEvent<WinitInput> for WinitMouseWheelEvent {
     fn source(&self) -> AxisSource {
-        match self.source {
-            ScrollSource::Wheel => AxisSource::Wheel,
-            ScrollSource::Finger => AxisSource::Finger,
-            ScrollSource::Momentum | ScrollSource::Unknown => AxisSource::Continuous,
+        match self.delta {
+            MouseScrollDelta::LineDelta(_, _) => AxisSource::Wheel,
+            MouseScrollDelta::PixelDelta(_) => AxisSource::Continuous,
             _ => AxisSource::Continuous,
         }
     }
